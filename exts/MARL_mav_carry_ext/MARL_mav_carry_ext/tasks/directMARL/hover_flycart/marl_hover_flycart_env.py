@@ -292,9 +292,9 @@ class MARLHoverFlycartEnv(DirectMARLEnv):
         self._ll_counter += 1
 
         # apply torques induced by rotors to each body
-        self.robot.set_external_force_and_torque(torch.zeros_like(self._moments), self._moments, self._falcon_idx)
+        self.robot.set_external_force_and_torque(torch.zeros_like(self._moments), self._moments, body_ids=self._falcon_idx)
         # apply forces to each rotor
-        self.robot.set_external_force_and_torque(self._forces, torch.zeros_like(self._forces), self._falcon_rotor_idx)
+        self.robot.set_external_force_and_torque(self._forces, torch.zeros_like(self._forces), body_ids=self._falcon_rotor_idx)
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
 

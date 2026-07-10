@@ -169,8 +169,8 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
     # rewards
     pos_track_weight = 1.5
     ori_track_weight = 1.5
-    action_smoothness_weight = 0.5
-    body_rate_penalty_weight = 0.5
+    action_smoothness_weight = 0.1
+    body_rate_penalty_weight = 0.1
     force_penalty_weight = 0.5
     downwash_rew_weight = 0.5
 
