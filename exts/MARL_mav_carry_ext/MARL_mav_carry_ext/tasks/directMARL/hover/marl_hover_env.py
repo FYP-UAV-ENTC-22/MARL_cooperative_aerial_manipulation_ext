@@ -12,8 +12,9 @@ import numpy as np
 import torch
 from collections.abc import Sequence
 
-from MARL_mav_carry_ext.controllers import GeometricController, IndiController
+from MARL_mav_carry_ext.controllers import GeometricController, IndiController, RaptorController
 from MARL_mav_carry_ext.controllers.motor_model import RotorMotor
+from MARL_mav_carry_ext.controllers.raptor import action_to_omega, assemble_observation
 from MARL_mav_carry_ext.tasks.managerbased.mdp_llc.utils import get_drone_pdist, get_drone_rpos
 
 import isaaclab.sim as sim_utils
@@ -32,7 +33,8 @@ from isaaclab.utils.math import (
     quat_from_euler_xyz,
     quat_inv,
     quat_mul,
-    quat_rotate,
+    quat_apply,
+    quat_apply_inverse,
     quat_unique,
     sample_uniform,
 )
@@ -77,6 +79,8 @@ class MARLHoverEnv(DirectMARLEnv):
                 self.prev_actions[agent] = torch.zeros(self.num_envs, 12, device=self.device)
             elif self._control_mode == "ACCBR":
                 self.prev_actions[agent] = torch.zeros(self.num_envs, 5, device=self.device)
+            elif self._control_mode == "raptor":
+                self.prev_actions[agent] = torch.zeros(self.num_envs, 3, device=self.device)
 
         self.drone_positions = torch.zeros(self.num_envs, self._num_drones, 3, device=self.device)
         self.drone_orientations = torch.zeros(self.num_envs, self._num_drones, 4, device=self.device)
@@ -91,16 +95,49 @@ class MARLHoverEnv(DirectMARLEnv):
 
         # outer loop controller
         self.geo_controllers = {}
-        for i in range(self._num_drones):
-            self.geo_controllers[i] = GeometricController(self.num_envs, self._control_mode)
+        self._indi_controllers = {}
+        self.raptor = None
+        if self._control_mode == "raptor":
+            # A single frozen policy replaces both the geometric and the INDI loop, and is
+            # evaluated for every drone of every environment in one batched call.
+            self.raptor = RaptorController(self.num_envs, self._num_drones, self.device)
+        else:
+            for i in range(self._num_drones):
+                self.geo_controllers[i] = GeometricController(self.num_envs, self._control_mode)
+                self._indi_controllers[i] = IndiController(self.num_envs)
         self._ll_counter = 0
         self._constant_yaw = torch.zeros([self.num_envs, 1], device=self.device)
         self._zeros = torch.zeros([self.num_envs, 3], device=self.device)
 
-        # inner loop controller
-        self._indi_controllers = {}
-        for i in range(self._num_drones):
-            self._indi_controllers[i] = IndiController(self.num_envs)
+        # RAPTOR setpoint state. sp_pos is an absolute env-frame position the high-level
+        # policy steers; it is seeded from the spawn pose on every reset.
+        self.sp_pos = torch.zeros(self.num_envs, self._num_drones, 3, device=self.device)
+        self.sp_vel = torch.zeros(self.num_envs, self._num_drones, 3, device=self.device)
+        # Target heading per drone. Yaw is a free DOF -- a single cable transmits no yaw
+        # torque -- but "free" means "costs nothing to hold", not "must be zero". The three
+        # Falcons are mounted at different azimuths around the payload, so commanding them
+        # all to yaw=0 rotates each out of its mounted orientation and twists the formation.
+        # Seeded from the spawn heading alongside sp_pos.
+        self.sp_yaw = torch.zeros(self.num_envs, self._num_drones, device=self.device)
+        # Set on reset, consumed on the next setpoint update: the spawn pose is only readable
+        # from the articulation once the observation pass has refreshed it.
+        self._sp_seed_pending = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        # Diagnostic: how often the policy asks for a setpoint further ahead than the leash
+        # allows. Persistently high means setpoint_step_scale outruns what the drone can fly.
+        self._leash_active_steps = torch.zeros(self.num_envs, device=self.device)
+        self._setpoint_steps = torch.zeros(self.num_envs, device=self.device)
+        self._rotor_permutation = torch.tensor(cfg.raptor_rotor_permutation, device=self.device)
+        # Rotation from the Falcon body frame into the virtual X-configuration frame RAPTOR
+        # was trained on. Identity when the airframe is already X.
+        theta = math.radians(cfg.raptor_yaw_offset_deg)
+        self._raptor_frame_rotation = torch.tensor(
+            [
+                [math.cos(theta), -math.sin(theta), 0.0],
+                [math.sin(theta), math.cos(theta), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            device=self.device,
+        )
 
         # motor model
         # experimentally obtained
@@ -141,7 +178,6 @@ class MARLHoverEnv(DirectMARLEnv):
                 "pos_reward",
                 "ori_reward",
                 "action_smoothness",
-                "body_rate_penalty",
                 "force_penalty",
                 "downwash_reward",
             ]
@@ -189,6 +225,10 @@ class MARLHoverEnv(DirectMARLEnv):
             # introduce delay in the setpoints
             # actions[agent][:] = self.setpoint_delay_buffers[agent].compute(actions[agent])
 
+        if self._control_mode == "raptor":
+            self._update_setpoints(actions)
+            return
+
         for drone, action in actions.items():
 
             if self._control_mode == "geometric":
@@ -207,8 +247,52 @@ class MARLHoverEnv(DirectMARLEnv):
             self._setpoints[drone]["yaw_rate"] = self._constant_yaw
             self._setpoints[drone]["yaw_acc"] = self._constant_yaw
 
+    def _update_setpoints(self, actions: dict[str, torch.Tensor]) -> None:
+        """Advance the per-drone position setpoint from the high-level actions.
+
+        The setpoint is absolute and persists across steps. Re-anchoring it to the drone's
+        current position every tick instead would cancel the position out of RAPTOR's
+        observation entirely -- the error would reduce to the negated action, leaving the
+        inner loop with no feedback and the cascade with no absolute reference.
+
+        A leash keeps the setpoint within RAPTOR's trained position-error envelope, so the
+        policy never operates against a saturated clip.
+        """
+        if self._sp_seed_pending.any():
+            # drone_positions was refreshed by the observation pass that follows every reset,
+            # so this is the first point at which the true spawn pose is available.
+            seed = self._sp_seed_pending.view(-1, 1, 1)
+            self.sp_pos = torch.where(seed, self.drone_positions, self.sp_pos)
+            self.sp_vel = torch.where(seed, torch.zeros_like(self.sp_vel), self.sp_vel)
+            spawn_yaw = torch.atan2(self.drone_rot_matrices[..., 1, 0], self.drone_rot_matrices[..., 0, 0])
+            self.sp_yaw = torch.where(seed.squeeze(-1), spawn_yaw, self.sp_yaw)
+            self._sp_seed_pending[:] = False
+
+        increment = torch.stack([actions[agent] for agent in self.cfg.possible_agents], dim=1)
+        increment = increment * self.cfg.setpoint_step_scale
+
+        self.sp_pos += increment
+        # The increment is the velocity command, so the feedforward is consistent with the
+        # position setpoint by construction rather than by a separate policy output.
+        self.sp_vel[:] = increment / self.step_dt
+
+        offset = self.sp_pos - self.drone_positions
+        distance = offset.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        scale = (self.cfg.setpoint_leash / distance).clamp(max=1.0)
+        self.sp_pos[:] = self.drone_positions + offset * scale
+
+        self._leash_active_steps += (scale < 1.0).any(dim=1).squeeze(-1).float()
+        self._setpoint_steps += 1.0
+
     def _apply_action(self) -> None:
         if self._ll_counter % self.cfg.low_level_decimation == 0:
+            if self._control_mode == "raptor":
+                self._compute_raptor_thrusts()
+                self._ll_counter = 0
+                self._apply_rotor_wrench()
+                self._ll_counter += 1
+                return
+
             all_thrusts = []
             all_moments = []
 
@@ -284,6 +368,87 @@ class MARLHoverEnv(DirectMARLEnv):
             self._ll_counter = 0
         self._ll_counter += 1
 
+        self._apply_rotor_wrench()
+
+    def _compute_raptor_thrusts(self) -> None:
+        """Run the RAPTOR inner loop for every drone and turn its output into rotor forces.
+
+        Mirrors the observation assembly the flight controller performs in
+        ``mc_raptor.cpp:344``. The sign flips there are PX4's NED/FRD -> FLU conversion and
+        are deliberately absent here: Isaac is already FLU.
+        """
+        self.drone_positions[:] = self.robot.data.body_com_state_w[
+            :, self._falcon_idx, :3
+        ] - self.scene.env_origins.unsqueeze(1)
+        self.drone_orientations[:] = self.robot.data.body_com_state_w[:, self._falcon_idx, 3:7]
+        self.drone_linear_velocities[:] = self.robot.data.body_com_state_w[:, self._falcon_idx, 7:10]
+        self.drone_angular_velocities[:] = self.robot.data.body_com_state_w[:, self._falcon_idx, 10:13]
+        self.drone_rot_matrices[:] = matrix_from_quat(self.drone_orientations)
+
+        # Express errors and orientation in the target-yaw frame, as mc_raptor.cpp:352 does:
+        #   error_t = Rz(yaw)^T @ error          orientation_t = Rz(yaw)^T @ R_world_body
+        target_rotation = self._yaw_rotation(self.sp_yaw)
+        position_error = torch.einsum("ndji,ndj->ndi", target_rotation, self.drone_positions - self.sp_pos)
+        velocity_error = torch.einsum(
+            "ndji,ndj->ndi", target_rotation, self.drone_linear_velocities - self.sp_vel
+        )
+        orientation = target_rotation.transpose(-1, -2) @ self.drone_rot_matrices
+
+        # body_com_state_w reports angular velocity in the world frame; RAPTOR expects it in
+        # the body frame, as the INDI controller also assumes (indi.py:101).
+        angular_velocity_body = quat_apply_inverse(
+            self.drone_orientations, self.drone_angular_velocities
+        )
+
+        # Express orientation and body rates in the virtual X-configuration frame. The
+        # position and velocity errors live in the target frame, not the body frame, so they
+        # are unaffected.
+        if self.cfg.raptor_yaw_offset_deg != 0.0:
+            orientation = orientation @ self._raptor_frame_rotation
+            angular_velocity_body = angular_velocity_body @ self._raptor_frame_rotation
+
+        observation = assemble_observation(
+            position_error,
+            orientation,
+            velocity_error,
+            angular_velocity_body,
+            self.raptor.previous_action,
+        )
+        action = self.raptor(observation)
+
+        # RAPTOR emits [front-right, back-right, back-left, front-left]; reorder into the
+        # order the rotor bodies were found in before handing over to the motor model.
+        target_omega = action_to_omega(
+            action[..., self._rotor_permutation], self.cfg.raptor_omega_min, self.cfg.raptor_omega_max
+        )
+
+        all_thrusts = []
+        all_moments = []
+        for i in range(self._num_drones):
+            thrusts, moments = self.motor_models[i].get_motor_thrusts_moments(
+                target_omega[:, i], self.sampling_time
+            )
+            all_thrusts.append(thrusts)
+            all_moments.append(moments)
+
+        self._forces[..., 2] = torch.cat(all_thrusts, dim=-1)
+        self._moments[..., 2] = torch.cat(all_moments, dim=-1).view(self.num_envs, self._num_drones, 4).sum(-1)
+
+    def _yaw_rotation(self, yaw: torch.Tensor) -> torch.Tensor:
+        """Rotation matrices about z for a batch of yaw angles, shaped (..., 3, 3)."""
+        cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
+        zeros, ones = torch.zeros_like(yaw), torch.ones_like(yaw)
+        return torch.stack(
+            (
+                torch.stack((cos_yaw, -sin_yaw, zeros), dim=-1),
+                torch.stack((sin_yaw, cos_yaw, zeros), dim=-1),
+                torch.stack((zeros, zeros, ones), dim=-1),
+            ),
+            dim=-2,
+        )
+
+    def _apply_rotor_wrench(self) -> None:
+        """Push the current rotor forces and reaction torques into the articulation."""
         # apply torques induced by rotors to each body
         self.robot.set_external_force_and_torque(torch.zeros_like(self._moments), self._moments, body_ids=self._falcon_idx)
         # apply forces to each rotor
@@ -497,11 +662,6 @@ class MARLHoverEnv(DirectMARLEnv):
             self.cfg.action_smoothness_weight * torch.exp(-torch.norm(diff_action, dim=-1).square()) * self.step_dt
         )
 
-        # commanded body rate reward
-        commanded_body_rates = torch.cat([self.actions[agent][:, 3:] for agent in self.cfg.possible_agents], dim=-1)
-        body_rate_penalty = torch.norm(commanded_body_rates / self._num_drones, dim=-1)
-        reward_body_rate_penalty = self.cfg.body_rate_penalty_weight * torch.exp(-body_rate_penalty) * self.step_dt
-
         # force penalty
         normalized_forces = self._forces[..., 2] / self.cfg.max_thrust_pp
         effort_sum = torch.max(normalized_forces, dim=-1)[0]
@@ -514,7 +674,6 @@ class MARLHoverEnv(DirectMARLEnv):
             "pos_reward": reward_position,
             "ori_reward": reward_orientation,
             "action_smoothness": reward_action_smoothness,
-            "body_rate_penalty": reward_body_rate_penalty,
             "force_penalty": reward_effort,
             "downwash_reward": reward_downwash,
         }
@@ -527,7 +686,6 @@ class MARLHoverEnv(DirectMARLEnv):
             reward_position
             + reward_orientation
             + reward_action_smoothness
-            + reward_body_rate_penalty
             + reward_effort
             + reward_downwash
         )
@@ -627,6 +785,29 @@ class MARLHoverEnv(DirectMARLEnv):
         # reset articulation and rigid body attributes
         super()._reset_idx(env_ids)
         self._reset_target_pose(env_ids)
+
+        if self._control_mode == "raptor":
+            # Defer seeding the setpoint until the spawn pose has been read back, and clear
+            # the policy's recurrent state: the GRU carries RAPTOR's online estimate of the
+            # vehicle it is flying, which is stale for a drone that just teleported.
+            self._sp_seed_pending[env_ids] = True
+            self.sp_vel[env_ids] = 0.0
+            self.raptor.reset(env_ids)
+
+            steps = self._setpoint_steps[env_ids].clamp(min=1.0)
+            self.extras.setdefault("log", dict())["Metrics/setpoint/leash_active_fraction"] = (
+                self._leash_active_steps[env_ids] / steps
+            ).mean()
+            self.extras["log"]["Metrics/setpoint/tracking_error"] = (
+                (self.sp_pos[env_ids] - self.drone_positions[env_ids]).norm(dim=-1).mean()
+            )
+            self._leash_active_steps[env_ids] = 0.0
+            self._setpoint_steps[env_ids] = 0.0
+            # Rotor speeds persist through the first-order lag, so they have to come back to
+            # the spawn value too -- otherwise the policy starts from a reset history against
+            # motors still spinning at whatever the previous episode ended on.
+            for motor_model in self.motor_models.values():
+                motor_model.reset(env_ids)
 
         for agent in self.cfg.possible_agents:
             # self.setpoint_delay_buffers[agent].reset(env_ids)
@@ -773,8 +954,8 @@ class MARLHoverEnv(DirectMARLEnv):
 
     def _downwash_reward(self):
         # Plane equation for the payload
-        x_len_payload_env = quat_rotate(self.load_orientation, self.load_length_x)
-        y_len_payload_env = quat_rotate(self.load_orientation, self.load_length_y)
+        x_len_payload_env = quat_apply(self.load_orientation, self.load_length_x)
+        y_len_payload_env = quat_apply(self.load_orientation, self.load_length_y)
         edge_payload_x = self.load_position + x_len_payload_env
         edge_payload_y = self.load_position + y_len_payload_env
         plane_vec1 = edge_payload_x - self.load_position
@@ -783,7 +964,7 @@ class MARLHoverEnv(DirectMARLEnv):
         d = torch.sum(normal * self.load_position, dim=-1).unsqueeze(-1).unsqueeze(-1)  # Shape (num_envs, 1, 1)
 
         # Line equations for each drone's thrust direction
-        thrust_directions = quat_rotate(
+        thrust_directions = quat_apply(
             self.drone_orientations.view(-1, 4),
             torch.tensor([[0, 0, 1.0]] * self.num_envs * self._num_drones, device=self.device),
         ).view(self.num_envs, self._num_drones, 3)

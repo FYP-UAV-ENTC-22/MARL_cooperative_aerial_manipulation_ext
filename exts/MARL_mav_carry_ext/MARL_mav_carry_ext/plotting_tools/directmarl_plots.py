@@ -92,6 +92,36 @@ class DirectMARLPlotter:
         # Loop through all drones
         for drone_num in range(drone_pos.shape[0]):
             ref_drone = policy_ref[drone_num * int(action_space) : (drone_num + 1) * int(action_space)]
+
+            if self.control_mode == "raptor":
+                # RAPTOR replaces both the geometric and the INDI loop, so none of their
+                # debug buffers exist. What matters here is how well the inner loop tracks
+                # the setpoint the high-level policy asked for.
+                both_drone_pos = torch.cat((self.env.sp_pos[0, drone_num], drone_pos[drone_num]), dim=-1)
+                both_drone_vel = torch.cat((self.env.sp_vel[0, drone_num], drone_vel[drone_num]), dim=-1)
+                setpoint_error = self.env.sp_pos[0, drone_num] - drone_pos[drone_num]
+                motor_commands = self.env.raptor.previous_action[0, drone_num]
+
+                if drone_num not in self.drone_data_by_id:
+                    self.drone_data_by_id[drone_num] = {
+                        "both_drone_pos": both_drone_pos.unsqueeze(0).tolist(),
+                        "both_drone_vel": both_drone_vel.unsqueeze(0).tolist(),
+                        "setpoint_error": setpoint_error.unsqueeze(0).tolist(),
+                        "raptor_motor_cmd": motor_commands.unsqueeze(0).tolist(),
+                        "rotor_forces": rotor_forces[(drone_num * 4) : (drone_num * 4) + 4]
+                        .unsqueeze(0)
+                        .tolist(),
+                    }
+                else:
+                    self.drone_data_by_id[drone_num]["both_drone_pos"].append(both_drone_pos.tolist())
+                    self.drone_data_by_id[drone_num]["both_drone_vel"].append(both_drone_vel.tolist())
+                    self.drone_data_by_id[drone_num]["setpoint_error"].append(setpoint_error.tolist())
+                    self.drone_data_by_id[drone_num]["raptor_motor_cmd"].append(motor_commands.tolist())
+                    self.drone_data_by_id[drone_num]["rotor_forces"].append(
+                        rotor_forces[(drone_num * 4) : (drone_num * 4) + 4].tolist()
+                    )
+                continue
+
             filtered_acc = self.env.geo_controllers[drone_num].filtered_acc[0]
             filtered_rate = self.env.geo_controllers[drone_num].filtered_rate[0]
             unfiltered_thrusts_geo = self.env.geo_controllers[drone_num].unfiltered_thrusts[0]

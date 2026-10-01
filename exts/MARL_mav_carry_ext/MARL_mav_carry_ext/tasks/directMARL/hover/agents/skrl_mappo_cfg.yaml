@@ -86,7 +86,7 @@ agent:
   # logging and checkpoint
   experiment:
     directory: "mappo_flycrane_hover"
-    experiment_name: "delete_me"
+    experiment_name: "raptor_v1"
     write_interval: 100
     checkpoint_interval: 5000
 

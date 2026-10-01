@@ -101,9 +101,9 @@ class EventCfg:
 @configclass
 class MARLHoverEnvCfg(DirectMARLEnvCfg):
     # control mode
-    control_mode = "ACCBR"  # ACCBR or geometric
+    control_mode = "raptor"  # raptor, ACCBR or geometric
     # env
-    decimation = 3
+    decimation = 6  # high-level policy at 50 Hz
     episode_length_s = 20
 
     # history of observations
@@ -126,6 +126,17 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
         else:
             obs_dim_accbr = 87
         observation_spaces = {"falcon1": obs_dim_accbr, "falcon2": obs_dim_accbr, "falcon3": obs_dim_accbr}
+        state_space = 84
+    elif control_mode == "raptor":
+        # The policy nudges an absolute position setpoint; the velocity feedforward is the
+        # derivative of that same increment, so it needs no outputs of its own.
+        action_dim_raptor = 3
+        action_spaces = {"falcon1": action_dim_raptor, "falcon2": action_dim_raptor, "falcon3": action_dim_raptor}
+        if partial_obs:
+            obs_dim_raptor = 45 * history_len
+        else:
+            obs_dim_raptor = 87
+        observation_spaces = {"falcon1": obs_dim_raptor, "falcon2": obs_dim_raptor, "falcon3": obs_dim_raptor}
         state_space = 84
 
     # simulation
@@ -163,14 +174,36 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
     goal_achieved_ori_range = 0.4
 
     # low level control
-    low_level_decimation: int = 1
+    low_level_decimation: int = 3  # RAPTOR at 100 Hz, its native training rate
     max_thrust_pp = 6.25  # N
+
+    # RAPTOR setpoint generation
+    setpoint_step_scale = 0.05  # m per high-level tick -> 2.5 m/s of authority at 50 Hz
+    # Anti-windup only: caps how far the setpoint can run ahead of a drone that cannot keep
+    # up. It must stay well ABOVE RAPTOR's 0.5 m error clip -- a leash tighter than the clip
+    # binds during normal tracking and drags the setpoint along behind a drifting drone,
+    # destroying the absolute position reference it exists to provide.
+    setpoint_leash = 1.5
+    # Rotor speed range the normalised motor command maps onto. Must match RotorMotor.
+    raptor_omega_min = 150.0
+    raptor_omega_max = 2800.0
+    # RAPTOR emits [front-right, back-right, back-left, front-left]. Entry j gives which of
+    # those four outputs drives Falcon rotor body j, so the remap is a plain gather. Derive
+    # it with
+    #   scripts/MARL_mav_carry/testing_scripts/raptor_single_drone.py --check-rotor-order
+    raptor_rotor_permutation = (3, 0, 1, 2)  # measured: slots are FL, FR, BR, BL
+    # RAPTOR was trained on X-configuration quadrotors, whose arms sit at +-45 deg from the
+    # body x axis. If the Falcon is a plus airframe (arms along +-x, +-y) its roll and pitch
+    # axes are rotated 45 deg from what RAPTOR assumes, and feeding it the raw body frame
+    # makes it pitch when it means to roll. This rotates the frame RAPTOR sees about body z
+    # to compensate. Harmless to apply: drone yaw is a free DOF here, since a single cable
+    # transmits no yaw torque. Derived by --check-rotor-order; 0.0 for a true X airframe.
+    raptor_yaw_offset_deg = 0.0
 
     # rewards
     pos_track_weight = 1.5
     ori_track_weight = 1.5
-    action_smoothness_weight = 0.1
-    body_rate_penalty_weight = 0.1
+    action_smoothness_weight = 0.5  # now penalises setpoint jerk, i.e. trajectory smoothness
     force_penalty_weight = 0.5
     downwash_rew_weight = 0.5
 
