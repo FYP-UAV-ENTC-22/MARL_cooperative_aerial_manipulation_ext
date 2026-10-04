@@ -1,0 +1,22 @@
+# The CASTOR payload and cables on the flycrane rig.
+#
+# The drones, the rigid-rod cables and every joint are the flycrane's (flycrane_rod_data/flycrane.urdf),
+# the rig the RAPTOR hover task was trained on. Only what is listed here changes. After editing:
+#
+#     python scripts/tools/gen_castor_urdf.py
+#
+# Units: m, kg, rad unless a key says _deg.
+
+payload:                      # solid disc, axis vertical, origin at its centre
+  radius: 0.5
+  height: 0.03
+  mass: 0.4
+  anchor_radius: 0.5          # cable attach radius (the rim)
+  anchor_height: 0.015        # above the centre (the top face)
+  angle_offset_deg: 0.0       # azimuth of anchor 1 from the payload's +x. Anchor i sits at
+                              # angle_offset + (i - 1) * 120 deg, counter-clockwise seen from above.
+                              # Falcon i (one-hot slot i - 1) flies on cable i.
+
+cable:
+  length: 2.0
+  spawn_angle_deg: 28.65      # cable angle from vertical at spawn (written to castor_spawn.yaml)

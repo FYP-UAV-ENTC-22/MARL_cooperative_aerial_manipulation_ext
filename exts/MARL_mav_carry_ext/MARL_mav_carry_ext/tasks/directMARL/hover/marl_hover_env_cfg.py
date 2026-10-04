@@ -164,6 +164,8 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
     payload_name = "load_odometry_sensor_link"
     # rope name and termination terms
     rope_name = "rope_.*_link"
+    # The cable body at the drone end, for a cable made of several bodies. None: the same as rope_name.
+    rope_top_name: str | None = None
     cable_angle_limits_drone = 0.0  # cos(angle) limits
     cable_angle_limits_payload = -math.sqrt(2) / 2  # cos(angle) limits
     cable_collision_threshold = 0.2
@@ -177,8 +179,30 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
     low_level_decimation: int = 3  # RAPTOR at 100 Hz, its native training rate
     max_thrust_pp = 6.25  # N
 
+    # motor model (RAPTOR mode). The defaults are the Falcon's.
+    motor_thrust_coeff = 1.562522e-06  # N s^2/rad^2
+    motor_torque_coeff = 3.4375484e-08  # N m s^2/rad^2
+    motor_time_constant = 0.033  # s
+    rotor_directions = (1.0, -1.0, 1.0, -1.0)  # sign of each rotor's yaw torque on the body
+    initial_rotor_speed: float | None = None  # rad/s at reset; None = the Falcon's measured hover speeds
+    thrust_scale_range = (1.0, 1.0)  # per-drone thrust scale, resampled every episode
+    linear_drag = (0.0, 0.0, 0.0)  # N/(m/s) on each drone, body frame
+
+    # Prismatic joints that set each cable's length, on assets that have them. Every episode each cable
+    # gets its own offset from the nominal length, drawn from the range.
+    cable_length_joint_names: str | None = None
+    cable_length_offset_range = (0.0, 0.0)  # m
+
+    # What the policy sees of the payload (the critic always sees the truth).
+    payload_obs_delay_steps = 0  # policy steps
+    payload_pos_noise_std = 0.0  # m
+    payload_rot_noise_std = 0.0  # rad
+
     # RAPTOR setpoint generation
     setpoint_step_scale = 0.05  # m per high-level tick -> 2.5 m/s of authority at 50 Hz
+    # Upper bound on how fast a setpoint may move. The policy's actions are unbounded, so without it
+    # setpoint_step_scale is only the speed at unit action. None: no bound.
+    setpoint_max_speed: float | None = None  # m/s
     # Anti-windup only: caps how far the setpoint can run ahead of a drone that cannot keep
     # up. It must stay well ABOVE RAPTOR's 0.5 m error clip -- a leash tighter than the clip
     # binds during normal tracking and drags the setpoint along behind a drifting drone,

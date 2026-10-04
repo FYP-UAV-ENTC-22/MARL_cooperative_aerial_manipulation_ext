@@ -182,5 +182,10 @@ def assemble_observation(
 
 
 def action_to_omega(action: torch.Tensor, omega_min: float, omega_max: float) -> torch.Tensor:
-    """Map motor commands in [-1, 1] onto rotor speeds, per the RAPTOR convention."""
-    return (omega_max - omega_min) * (action + 1.0) * 0.5 + omega_min
+    """Map motor commands in [-1, 1] onto rotor speeds, per the RAPTOR convention.
+
+    The policy's output is not bounded, but a motor is: PX4 limits ``actuator_motors`` to [0, 1], which
+    is [-1, 1] here. Without the clamp a command of -2.6 becomes a negative rotor speed and, squared, a
+    thrust several times the motor's maximum, which is enough to blow the simulation up.
+    """
+    return (omega_max - omega_min) * (action.clamp(-1.0, 1.0) + 1.0) * 0.5 + omega_min

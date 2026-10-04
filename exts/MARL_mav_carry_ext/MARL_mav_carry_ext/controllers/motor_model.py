@@ -2,22 +2,39 @@ import torch
 
 
 class RotorMotor:
-    def __init__(self, num_envs: int, init_omega: torch.Tensor):
+    def __init__(
+        self,
+        num_envs: int,
+        init_omega: torch.Tensor,
+        thrust_coeff: float = 1.562522e-06,
+        torque_coeff: float = 3.4375484e-08,
+        tau_up: float = 0.033,
+        tau_down: float = 0.033,
+        directions: tuple[float, ...] = (1.0, -1.0, 1.0, -1.0),
+    ):
+        """The defaults are the Falcon's, experimentally obtained.
+
+        Args:
+            thrust_coeff: thrust per rotor speed squared [N s^2/rad^2].
+            torque_coeff: reaction torque per rotor speed squared [N m s^2/rad^2].
+            tau_up, tau_down: first-order time constants of the rotor speed [s].
+            directions: sign of the yaw torque each rotor puts on the body.
+        """
         # motor parameters
         self.init_omega = init_omega
         self.num_envs = num_envs
         self.motor_omega_min = 150.0
         self.motor_omega_max = 2800.0
-        self.tau_up = 0.033
-        self.tau_down = 0.033
+        self.tau_up = tau_up
+        self.tau_down = tau_down
         self.motor_inertia = 9.3575e-6
 
         # rotor parameters
-        self.thrust_map = torch.tensor([1.562522e-06, 0.0, 0.0])
-        self.torque_map = torch.tensor([3.4375484e-08, 0.0, 0.0])
+        self.thrust_map = torch.tensor([thrust_coeff, 0.0, 0.0])
+        self.torque_map = torch.tensor([torque_coeff, 0.0, 0.0])
 
         self.current_omega = init_omega
-        self.direction = torch.tensor([1.0, -1.0, 1.0, -1.0], device="cuda")
+        self.direction = torch.tensor(directions, device=init_omega.device)
 
     def get_motor_thrusts_moments(self, target_rates: torch.Tensor, sampling_time: float):
         """

@@ -10,3 +10,5 @@ profile.sh
 *.sqlite3
 *.db
 reference_trajectories/
+# USD cache of the generated CASTOR rig (see assets/flycastor.py)
+exts/MARL_mav_carry_ext/MARL_mav_carry_ext/assets/data/AMR/flycastor/
