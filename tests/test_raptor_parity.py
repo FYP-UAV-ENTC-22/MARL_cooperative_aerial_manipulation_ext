@@ -71,6 +71,35 @@ def test_reset_restores_initial_state(device: str = "cpu") -> None:
     assert not torch.equal(after[1], first[1]), "untouched environment was reset as well"
 
 
+def test_px4_executor(device: str = "cpu") -> None:
+    """The PX4-style executor must reduce to the plain policy at the native rate, and hold its state between native steps."""
+    blob = np.load(DEFAULT_CHECKPOINT)
+    reference_input = torch.from_numpy(blob["example_input"]).to(device)[:200]  # (steps, 2, 22)
+    batch = reference_input.shape[1]
+
+    # native_every = 1 is one evaluation per call: the plain policy, with the output clamped. The executor
+    # supplies the previous action itself, so the two only agree while the recorded one matches its own.
+    plain = RaptorController(num_envs=1, num_drones=batch, device=device)
+    px4 = RaptorController(num_envs=1, num_drones=batch, device=device)
+    px4.reset_px4()
+    for t in range(reference_input.shape[0]):
+        observation = reference_input[t].unsqueeze(0).clone()
+        observation[..., -4:] = plain.previous_action.clamp(-1.0, 1.0)
+        expected = plain(observation).clamp(-1.0, 1.0)
+        plain.previous_action = expected
+        got = px4.step_px4(observation[..., :-4], native_every=1)
+        assert (got - expected).abs().max().item() < 1e-6, f"step {t}: native_every=1 differs from the plain policy"
+
+    # native_every = 2: the recurrent state changes on calls 0, 2, 4, ... only
+    px4.reset_px4()
+    changed = []
+    for t in range(6):
+        before = px4.hidden_state.clone()
+        px4.step_px4(reference_input[t].unsqueeze(0)[..., :-4], native_every=2)
+        changed.append(bool((px4.hidden_state - before).abs().max().item() > 0))
+    assert changed == [True, False, True, False, True, False], f"native steps at the wrong calls: {changed}"
+
+
 def test_action_to_omega() -> None:
     """The mapping must span exactly the motor's range."""
     action = torch.tensor([-1.0, 0.0, 1.0])
@@ -86,6 +115,8 @@ if __name__ == "__main__":
 
     test_reset_restores_initial_state()
     print("reset semantics              ok")
+    test_px4_executor()
+    print("PX4 executor                 ok")
     test_action_to_omega()
     print("action -> omega mapping      ok")
     print("\nall parity checks passed")

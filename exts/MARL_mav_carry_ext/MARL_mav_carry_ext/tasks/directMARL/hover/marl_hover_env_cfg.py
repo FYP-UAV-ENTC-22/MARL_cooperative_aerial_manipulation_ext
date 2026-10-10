@@ -172,6 +172,14 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
     cable_collision_num_points = 10
     drone_collision_threshold = 0.6
     bounding_box_threshold = 5.0
+    # A limit on how fast a drone itself may fly, as opposed to its setpoint. Above drone_speed_soft_limit the
+    # reward is penalised, growing up to the limit; above drone_speed_limit the episode ends. None: no limit.
+    drone_speed_limit: float | None = None  # m/s
+    drone_speed_soft_limit = 0.0  # m/s
+    drone_speed_penalty_weight = 0.0
+    # End an episode whose bodies move faster than anything in flight: a simulation that has started to diverge is
+    # reset before it produces non-finite numbers, which would poison every environment through the policy update.
+    max_body_speed: float | None = None  # m/s
     goal_achieved_range = 0.3
     goal_achieved_ori_range = 0.4
 
@@ -192,6 +200,30 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
     # gets its own offset from the nominal length, drawn from the range.
     cable_length_joint_names: str | None = None
     cable_length_offset_range = (0.0, 0.0)  # m
+
+    # RAPTOR the way PX4's mc_raptor runs it: called every low_level_decimation physics steps, its recurrent
+    # state advancing only every raptor_native_every-th call (PX4: IMU_GYRO_RATEMAX // 100). None: one plain
+    # evaluation per call, which is right when the call rate is RAPTOR's native 100 Hz.
+    raptor_native_every: int | None = None
+    # Motor lag drawn per environment every episode; None keeps motor_time_constant.
+    motor_time_constant_range: tuple[float, float] | None = None
+
+    # Cables that can go slack: the prismatic joint of each telescoping cable (0 at full length, negative
+    # when shorter). An episode ends when a cable stays more than cable_slack_tolerance short for
+    # cable_slack_time; a cable pulling less than cable_tension_ref is penalised in the reward.
+    cable_slide_joint_names: str | None = None
+    cable_slack_tolerance = 0.03  # m
+    cable_slack_time = 0.2  # s
+    slack_penalty_weight = 0.0
+    cable_tension_ref = 0.5  # N
+
+    # What the policy sees of its own drone: noise per sample, and a delay drawn per environment every
+    # episode, in policy steps, on the whole observation frame.
+    drone_pos_noise_std = 0.0  # m
+    drone_rot_noise_std = 0.0  # rad
+    drone_lin_vel_noise_std = 0.0  # m/s
+    drone_ang_vel_noise_std = 0.0  # rad/s
+    obs_delay_steps_range = (0, 0)
 
     # What the policy sees of the payload (the critic always sees the truth).
     payload_obs_delay_steps = 0  # policy steps

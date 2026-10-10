@@ -1,0 +1,73 @@
+# The CASTOR rig as castor-main simulates it: three Holybro S500 quadrotors carrying a disc on cables that can go slack.
+#
+# Source of truth is castor-main: components/simulation/assets/config/s500.yaml and payload_rig_marl_s500.yaml, with the
+# mass properties from castor_assets.geometry. Numbers here are copied from there; when the real airframe is
+# measured, update castor-main first, then this file, then regenerate:
+#
+#     python scripts/tools/gen_s500_rig_urdf.py
+#
+# Units: m, kg, N, s, rad unless a key says _deg. Body frame is FLU (x forward, y left, z up).
+
+num_drones: 3
+
+payload:                      # solid disc, axis vertical, origin at its centre
+  radius: 0.3
+  height: 0.03
+  mass: 0.4
+  anchor_radius: 0.3          # cable attach radius (the rim)
+  anchor_height: 0.015        # above the centre (the top face)
+  angle_offset_deg: 0.0       # azimuth of anchor 1 from the payload's +x. Anchor i sits at
+                              # angle_offset + (i - 1) * 120 deg, counter-clockwise seen from above.
+                              # Drone i (one-hot slot i - 1) flies on cable i.
+
+cable:                        # castor-main's `distance` cable: a maximum length, free to shorten, no shape
+  length: 3.0
+  mass: 0.0236                # split over the two halves of the telescoping link that stands in for it
+  radius: 0.0025
+  min_length: 0.3             # how short the link can telescope; never reached in flight
+  spawn_angle_deg: 28.65      # cable angle from vertical at spawn (written to s500_spawn.yaml)
+  ball_link_mass: 0.0002      # the two links inside each ball joint
+  ball_link_inertia: 1.0e-5
+
+drone:                        # Holybro S500 V2, 2216 KV920, 9450 props, 4S
+  body_mass: 1.444            # without propellers; 1.500 all-up
+  com: [-0.00166, 0.0, -0.02520]
+  inertia: [0.017596, 0.018587, 0.024065]   # ixx iyy izz about the CoM (products of inertia < 2 %, dropped)
+  mount_offset_z: -0.1875     # cable tie point below the body origin: the rod between the feet, level with the skids
+  heading: outward            # outward = each drone faces away from the payload, as castor-main spawns them
+  mount_rod_diameter: 0.010
+  # Geometry below is s500.yaml's, used for what the drone looks like and what it collides with.
+  frame:
+    wheelbase: 0.480
+    plate_size: [0.150, 0.150]
+    plate_thickness: 0.0015
+    arm_width: 0.034
+    arm_height: 0.022
+    arm_root_radius: 0.055
+  motor: {diameter: 0.028, height: 0.030}
+  landing_gear:
+    pole_diameter: 0.016
+    pole_length: 0.140
+    pole_spacing: 0.120
+    pole_x: 0.0
+    top_mount_height: 0.012
+    tee_size: [0.032, 0.026, 0.036]
+    skid_diameter: 0.016
+    foam_diameter: 0.026
+    skid_length: 0.280
+  battery_mount: {rail_diameter: 0.010, rail_length: 0.300, rail_spacing: 0.068, drop: 0.023}
+  boxes:                      # the mass-budget items castor-main draws
+    battery: {size: [0.135, 0.043, 0.035], pos: [0.0, 0.0, -0.061]}
+    avionics: {size: [0.090, 0.060, 0.030], pos: [0.0, 0.0, 0.0275]}
+    gps_mast: {size: [0.050, 0.050, 0.015], pos: [-0.060, 0.0, 0.110]}
+  rotor:
+    # PX4 quad-X order: 0 front-right, 1 back-left, 2 front-left, 3 back-right
+    positions:
+      - [0.170, -0.170, 0.049]
+      - [-0.170, 0.170, 0.049]
+      - [0.170, 0.170, 0.049]
+      - [-0.170, -0.170, 0.049]
+    spin: [-1, -1, 1, 1]      # -1 = counter-clockwise (light blades), 1 = clockwise (dark blades)
+    prop_mass: 0.014
+    prop_radius: 0.1194
+    prop_inertia: [6.65e-5, 6.65e-5, 1.3e-4]

@@ -139,6 +139,17 @@ def main() -> bool:
             ok &= passed
             print(f"  {name:32s} {value:8.4f} m     (limit {limit:g})  {'ok' if passed else 'FAIL'}")
 
+    if u._cable_slide_joint_ids is not None:
+        print("\n--- cables (slide 0 = full length, negative = shorter) ---")
+        slide = robot.data.joint_pos[:, u._cable_slide_joint_ids][alive]
+        tension = u._cable_tension[alive]
+        print(f"  slide position: {slide.min().item():+.4f} .. {slide.max().item():+.4f} m")
+        print(f"  tension from the joint reaction: mean {tension.mean().item():.2f} N, "
+              f"min {tension.min().item():.2f}, max {tension.max().item():.2f} (1.5 N expected at rest)")
+        taut = slide.min().item() > -cfg.cable_slack_tolerance
+        ok &= taut and 0.5 < tension.mean().item() < 4.0
+        print(f"  {'all cables taut':32s} {'ok' if taut else 'FAIL'}")
+
     if cfg.setpoint_max_speed is not None:
         print("\n--- setpoint speed limit, with every action at +10 along x for 2 s ---")
         push = {a: torch.zeros(args.num_envs, cfg.action_spaces[a], device=u.device) for a in cfg.possible_agents}
@@ -158,6 +169,9 @@ def main() -> bool:
         ok &= passed
         print(f"  {'setpoint speed, max':32s} {setpoint_speed:8.3f} m/s   (limit {cfg.setpoint_max_speed:g})  {'ok' if passed else 'FAIL'}")
         print(f"  {'drone speed, max':32s} {drone_speed:8.3f} m/s   ({resets} episodes ended during the push)")
+        if cfg.drone_speed_limit is not None:
+            print(f"  (the task ends an episode above {cfg.drone_speed_limit} m/s; this push is the worst case, "
+                  f"every setpoint driven at full speed the same way)")
 
     print("\n--- RAPTOR input clipping ---")
     big = torch.full((1, 3), 9.0, device=u.device)

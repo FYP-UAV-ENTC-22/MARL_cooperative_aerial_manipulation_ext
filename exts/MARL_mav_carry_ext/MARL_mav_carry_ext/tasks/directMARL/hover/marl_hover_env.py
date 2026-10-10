@@ -170,6 +170,25 @@ class MARLHoverEnv(DirectMARLEnv):
         self._cable_length_joint_ids = None
         if cfg.cable_length_joint_names is not None:
             self._cable_length_joint_ids = self.robot.find_joints(cfg.cable_length_joint_names)[0]
+        self._cable_slide_joint_ids = None
+        if cfg.cable_slide_joint_names is not None:
+            self._cable_slide_joint_ids = self.robot.find_joints(cfg.cable_slide_joint_names)[0]
+        self._cable_slack_time = torch.zeros(self.num_envs, self._num_drones, device=self.device)
+        self._cable_tension = torch.zeros(self.num_envs, self._num_drones, device=self.device)
+        self.cable_slack = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.drone_overspeed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._drone_speed = torch.zeros(self.num_envs, self._num_drones, device=self.device)
+        # each agent's observation frame can arrive late, by a number of policy steps fixed for the episode
+        self._frame_delays = None
+        if cfg.obs_delay_steps_range[1] > 0:
+            self._frame_delays = {
+                agent: DelayBuffer(cfg.obs_delay_steps_range[1], self.num_envs, device=self.device)
+                for agent in cfg.possible_agents
+            }
+        if cfg.motor_time_constant_range is not None:
+            self._motor_tau = torch.full((self.num_envs, 1), cfg.motor_time_constant, device=self.device)
+            for motor_model in self.motor_models.values():
+                motor_model.tau_up = motor_model.tau_down = self._motor_tau
         # Per-environment thrust scale, resampled on reset: a worn propeller, a sagging battery.
         self._thrust_scale = torch.ones(self.num_envs, self._num_drones, 1, device=self.device)
         # What the policy sees of the payload can lag and carry noise; the critic sees the truth.
@@ -208,6 +227,7 @@ class MARLHoverEnv(DirectMARLEnv):
                 "action_smoothness",
                 "force_penalty",
                 "downwash_reward",
+                "slack_penalty",
             ]
         }
 
@@ -451,7 +471,11 @@ class MARLHoverEnv(DirectMARLEnv):
             angular_velocity_body,
             self.raptor.previous_action,
         )
-        action = self.raptor(observation)
+        if self.cfg.raptor_native_every is None:
+            action = self.raptor(observation)
+        else:
+            # the executor supplies the previous-action input itself
+            action = self.raptor.step_px4(observation[..., : -self.raptor.ACTION_DIM], self.cfg.raptor_native_every)
 
         # RAPTOR emits [front-right, back-right, back-left, front-left]; reorder into the
         # order the rotor bodies were found in before handing over to the motor model.
@@ -534,16 +558,19 @@ class MARLHoverEnv(DirectMARLEnv):
 
         if self.cfg.partial_obs:
             load_position, load_matrix, goal_pos_error, difference_matrix = self._payload_observation(goal_load_matrix)
+            drone_positions, drone_rot_matrices, drone_linear_velocities, drone_angular_velocities = (
+                self._drone_observation()
+            )
             obs_falcon1_t = torch.cat(
                 (
                     load_position,
                     load_matrix.view(self.num_envs, -1),
                     # drone terms
                     torch.tensor([[1, 0, 0]] * self.num_envs, device=self.device),
-                    self.drone_positions[:, 0].view(self.num_envs, -1),
-                    self.drone_rot_matrices[:, 0].view(self.num_envs, -1),
-                    self.drone_linear_velocities[:, 0].view(self.num_envs, -1),
-                    self.drone_angular_velocities[:, 0].view(self.num_envs, -1),
+                    drone_positions[:, 0].view(self.num_envs, -1),
+                    drone_rot_matrices[:, 0].view(self.num_envs, -1),
+                    drone_linear_velocities[:, 0].view(self.num_envs, -1),
+                    drone_angular_velocities[:, 0].view(self.num_envs, -1),
                     goal_pos_error,
                     difference_matrix.view(self.num_envs, -1),
                     # self.all_action_histories.reshape(self.num_envs, -1),
@@ -551,6 +578,8 @@ class MARLHoverEnv(DirectMARLEnv):
                 dim=-1,
             )
 
+            if self._frame_delays is not None:
+                obs_falcon1_t = self._frame_delays["falcon1"].compute(obs_falcon1_t)
             self._observation_buffers["falcon1"].append(obs_falcon1_t)
 
             obs_falcon2_t = torch.cat(
@@ -559,10 +588,10 @@ class MARLHoverEnv(DirectMARLEnv):
                     load_matrix.view(self.num_envs, -1),
                     # drone terms
                     torch.tensor([[0, 1, 0]] * self.num_envs, device=self.device),
-                    self.drone_positions[:, 1].view(self.num_envs, -1),
-                    self.drone_rot_matrices[:, 1].view(self.num_envs, -1),
-                    self.drone_linear_velocities[:, 1].view(self.num_envs, -1),
-                    self.drone_angular_velocities[:, 1].view(self.num_envs, -1),
+                    drone_positions[:, 1].view(self.num_envs, -1),
+                    drone_rot_matrices[:, 1].view(self.num_envs, -1),
+                    drone_linear_velocities[:, 1].view(self.num_envs, -1),
+                    drone_angular_velocities[:, 1].view(self.num_envs, -1),
                     goal_pos_error,
                     difference_matrix.view(self.num_envs, -1),
                     # self.all_action_histories.reshape(self.num_envs, -1),
@@ -570,6 +599,8 @@ class MARLHoverEnv(DirectMARLEnv):
                 dim=-1,
             )
 
+            if self._frame_delays is not None:
+                obs_falcon2_t = self._frame_delays["falcon2"].compute(obs_falcon2_t)
             self._observation_buffers["falcon2"].append(obs_falcon2_t)
 
             obs_falcon3_t = torch.cat(
@@ -578,10 +609,10 @@ class MARLHoverEnv(DirectMARLEnv):
                     load_matrix.view(self.num_envs, -1),
                     # drone terms
                     torch.tensor([[0, 0, 1]] * self.num_envs, device=self.device),
-                    self.drone_positions[:, 2].view(self.num_envs, -1),
-                    self.drone_rot_matrices[:, 2].view(self.num_envs, -1),
-                    self.drone_linear_velocities[:, 2].view(self.num_envs, -1),
-                    self.drone_angular_velocities[:, 2].view(self.num_envs, -1),
+                    drone_positions[:, 2].view(self.num_envs, -1),
+                    drone_rot_matrices[:, 2].view(self.num_envs, -1),
+                    drone_linear_velocities[:, 2].view(self.num_envs, -1),
+                    drone_angular_velocities[:, 2].view(self.num_envs, -1),
                     goal_pos_error,
                     difference_matrix.view(self.num_envs, -1),
                     # self.all_action_histories.reshape(self.num_envs, -1),
@@ -589,6 +620,8 @@ class MARLHoverEnv(DirectMARLEnv):
                 dim=-1,
             )
 
+            if self._frame_delays is not None:
+                obs_falcon3_t = self._frame_delays["falcon3"].compute(obs_falcon3_t)
             self._observation_buffers["falcon3"].append(obs_falcon3_t)
 
             obs_falcon1 = self._observation_buffers["falcon1"].buffer.reshape(self.num_envs, -1)
@@ -658,6 +691,24 @@ class MARLHoverEnv(DirectMARLEnv):
             "falcon3": obs_falcon3,
         }
         return observations
+
+    def _drone_observation(self):
+        """Each drone's state as its own policy sees it: the estimator's output, so with noise."""
+        cfg = self.cfg
+        position, rotation = self.drone_positions, self.drone_rot_matrices
+        lin_vel, ang_vel = self.drone_linear_velocities, self.drone_angular_velocities
+        if cfg.drone_pos_noise_std > 0.0:
+            position = position + torch.randn_like(position) * cfg.drone_pos_noise_std
+        if cfg.drone_rot_noise_std > 0.0:
+            axis = torch.nn.functional.normalize(torch.randn_like(position), dim=-1).view(-1, 3)
+            angle = torch.randn(axis.shape[0], device=self.device) * cfg.drone_rot_noise_std
+            noisy = quat_mul(quat_from_angle_axis(angle, axis), self.drone_orientations.view(-1, 4))
+            rotation = matrix_from_quat(noisy).view(self.num_envs, self._num_drones, 3, 3)
+        if cfg.drone_lin_vel_noise_std > 0.0:
+            lin_vel = lin_vel + torch.randn_like(lin_vel) * cfg.drone_lin_vel_noise_std
+        if cfg.drone_ang_vel_noise_std > 0.0:
+            ang_vel = ang_vel + torch.randn_like(ang_vel) * cfg.drone_ang_vel_noise_std
+        return position, rotation, lin_vel, ang_vel
 
     def _payload_observation(self, goal_load_matrix: torch.Tensor):
         """The payload pose as the policy sees it, and the goal errors computed from it.
@@ -740,7 +791,20 @@ class MARLHoverEnv(DirectMARLEnv):
         # downwash reward
         reward_downwash = self.cfg.downwash_rew_weight * self._downwash_reward() * self.step_dt
 
+        # cables pulling less than the reference tension
+        reward_slack = torch.zeros_like(reward_position)
+        if self._cable_slide_joint_ids is not None and self.cfg.slack_penalty_weight > 0.0:
+            low_tension = (1.0 - self._cable_tension / self.cfg.cable_tension_ref).clamp(0.0, 1.0)
+            reward_slack = -self.cfg.slack_penalty_weight * low_tension.mean(dim=-1) * self.step_dt
+
+        # drones flying faster than the soft speed limit
+        if self.cfg.drone_speed_limit is not None and self.cfg.drone_speed_penalty_weight > 0.0:
+            span = max(self.cfg.drone_speed_limit - self.cfg.drone_speed_soft_limit, 1e-6)
+            over = ((self._drone_speed - self.cfg.drone_speed_soft_limit) / span).clamp(0.0, 1.0)
+            reward_slack = reward_slack - self.cfg.drone_speed_penalty_weight * over.mean(dim=-1) * self.step_dt
+
         rewards = {
+            "slack_penalty": reward_slack,
             "pos_reward": reward_position,
             "ori_reward": reward_orientation,
             "action_smoothness": reward_action_smoothness,
@@ -758,6 +822,7 @@ class MARLHoverEnv(DirectMARLEnv):
             + reward_action_smoothness
             + reward_effort
             + reward_downwash
+            + reward_slack
         )
 
         return {agent: shared_rewards for agent in self.cfg.possible_agents}
@@ -830,9 +895,30 @@ class MARLHoverEnv(DirectMARLEnv):
         # update metrics
         self._update_metrics()
 
+        # A cable that stays slack: the payload is not being carried. A brief dip during a fast move is fine.
+        if self._cable_slide_joint_ids is not None:
+            shortfall = -self.robot.data.joint_pos[:, self._cable_slide_joint_ids]
+            slack = shortfall > self.cfg.cable_slack_tolerance
+            self._cable_slack_time = torch.where(slack, self._cable_slack_time + self.step_dt, 0.0)
+            self.cable_slack = (self._cable_slack_time > self.cfg.cable_slack_time).any(dim=-1)
+            # The slide joint only pushes back on its limit, so its reaction along the cable is the tension.
+            wrench = self.robot.data.body_incoming_joint_wrench_b[:, self._rope_top_idx]
+            self._cable_tension = wrench[..., 2].abs()
+
+        drone_speed = self.robot.data.body_com_state_w[:, self._falcon_idx, 7:10].norm(dim=-1)
+        self._drone_speed = drone_speed
+        if self.cfg.drone_speed_limit is not None:
+            self.drone_overspeed = (drone_speed > self.cfg.drone_speed_limit).any(dim=-1)
+
+        if self.cfg.max_body_speed is not None:
+            speed = self.robot.data.body_com_state_w[..., 7:10].norm(dim=-1).max(dim=-1).values
+            self.body_pos_outside = self.body_pos_outside | ~(speed < self.cfg.max_body_speed)  # also catches NaN
+
         # reset when episode ends
         terminations = (
-            self.falcon_fly_low
+            self.cable_slack
+            | self.drone_overspeed
+            | self.falcon_fly_low
             | self.payload_fly_low
             | self.illegal_contact
             | self.angle_limit_drone
@@ -873,7 +959,10 @@ class MARLHoverEnv(DirectMARLEnv):
             # vehicle it is flying, which is stale for a drone that just teleported.
             self._sp_seed_pending[env_ids] = True
             self.sp_vel[env_ids] = 0.0
-            self.raptor.reset(env_ids)
+            if self.cfg.raptor_native_every is None:
+                self.raptor.reset(env_ids)
+            else:
+                self.raptor.reset_px4(env_ids)
 
             steps = self._setpoint_steps[env_ids].clamp(min=1.0)
             self.extras.setdefault("log", dict())["Metrics/setpoint/leash_active_fraction"] = (
@@ -889,6 +978,9 @@ class MARLHoverEnv(DirectMARLEnv):
             # motors still spinning at whatever the previous episode ended on.
             for motor_model in self.motor_models.values():
                 motor_model.reset(env_ids)
+            if self.cfg.motor_time_constant_range is not None:
+                low, high = self.cfg.motor_time_constant_range
+                self._motor_tau[env_ids] = sample_uniform(low, high, (len(env_ids), 1), device=self.device)
             low, high = self.cfg.thrust_scale_range
             self._thrust_scale[env_ids] = sample_uniform(
                 low, high, (len(env_ids), self._num_drones, 1), device=self.device
@@ -899,10 +991,26 @@ class MARLHoverEnv(DirectMARLEnv):
             self._observation_buffers[agent].reset(env_ids)
         if self._payload_obs_delay is not None:
             self._payload_obs_delay.reset(env_ids)
+        if self._frame_delays is not None:
+            low, high = self.cfg.obs_delay_steps_range
+            lags = torch.randint(low, high + 1, (len(env_ids),), device=self.device, dtype=torch.int)
+            for delay in self._frame_delays.values():
+                delay.reset(env_ids)
+                delay.set_time_lag(lags, env_ids)
+        self._cable_slack_time[env_ids] = 0.0
 
         # log reward components
         if "log" not in self.extras:
             self.extras["log"] = dict()
+        if self.cfg.drone_speed_limit is not None:
+            self.extras["log"]["Episode_Termination/drone_overspeed"] = torch.count_nonzero(
+                self.drone_overspeed[env_ids]
+            ).item()
+            self.extras["log"]["Metrics/drone_speed_max"] = self._drone_speed.max(dim=-1).values.mean()
+        if self._cable_slide_joint_ids is not None:
+            self.extras["log"]["Episode_Termination/cable_slack"] = torch.count_nonzero(self.cable_slack[env_ids]).item()
+            self.extras["log"]["Metrics/cable/tension_mean"] = self._cable_tension.mean()
+            self.extras["log"]["Metrics/cable/tension_min"] = self._cable_tension.min(dim=-1).values.mean()
         self.extras["log"]["Episode_Termination/angle_drones_cable"] = torch.count_nonzero(
             self.angle_limit_drone[env_ids]
         ).item()

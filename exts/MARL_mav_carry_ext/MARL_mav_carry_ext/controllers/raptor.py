@@ -147,6 +147,62 @@ class RaptorController(nn.Module):
         return self.previous_action
 
 
+    def reset_px4(self, env_ids: torch.Tensor | slice | None = None):
+        """:meth:`reset`, plus the PX4 executor's own state."""
+        self.reset(env_ids)
+        self._ensure_px4_state()
+        if env_ids is None:
+            env_ids = slice(None)
+        self._steps_since_native[env_ids] = 0
+        self._substep[env_ids] = 0
+        self._action_history[env_ids] = 0.0
+
+    def _ensure_px4_state(self):
+        if not hasattr(self, "_substep"):
+            shape = (self.num_envs, self.num_drones)
+            self._substep = torch.zeros(shape, dtype=torch.long, device=self.device)
+            self._steps_since_native = torch.zeros(shape, dtype=torch.long, device=self.device)
+            self._action_history = torch.zeros(*shape, self.ACTION_DIM, device=self.device)
+
+    @torch.no_grad()
+    def step_px4(self, core_observation: torch.Tensor, native_every: int) -> torch.Tensor:
+        """One call of the policy the way PX4's ``mc_raptor`` makes it, on every gyro sample.
+
+        The flight controller calls the policy faster than the 100 Hz it was trained at. Only every
+        ``native_every``-th call advances the recurrent state (a "native" step); the calls in between
+        evaluate from the current state without advancing it. The previous-action input is the mean of
+        the actions since the last native step. This is the rl_tools L2F executor, as ported in
+        castor-main (components/simulation/tests/raptor/raptor_backend.py).
+
+        ``native_every`` is PX4's ``IMU_GYRO_RATEMAX // 100``: 2 at 250 Hz, 4 at 400 Hz.
+
+        Args:
+            core_observation: ``(num_envs, num_drones, 18)``, the observation without the previous action.
+
+        Returns:
+            ``(num_envs, num_drones, 4)`` motor commands, clamped to [-1, 1].
+        """
+        self._ensure_px4_state()
+        first = (self._steps_since_native == 0).unsqueeze(-1)
+        n = self._steps_since_native.unsqueeze(-1).float()
+        running_mean = (self._action_history * n + self.previous_action) / (n + 1.0)
+        self._action_history = torch.where(first, self.previous_action, running_mean)
+
+        flat = torch.cat((core_observation, self._action_history), dim=-1).reshape(-1, self.OBS_DIM)
+        hidden = self.hidden_state.reshape(-1, self.HIDDEN_DIM)
+        new_hidden = self.gru(torch.relu(self.dense0(flat)), hidden)
+        action = self.dense2(new_hidden).view(self.num_envs, self.num_drones, self.ACTION_DIM).clamp(-1.0, 1.0)
+
+        native = (self._substep % native_every == 0)
+        self.hidden_state = torch.where(
+            native.unsqueeze(-1), new_hidden.view(self.num_envs, self.num_drones, self.HIDDEN_DIM), self.hidden_state
+        )
+        self._steps_since_native = torch.where(native, torch.zeros_like(self._substep), self._steps_since_native + 1)
+        self._substep += 1
+        self.previous_action = action
+        return action
+
+
 def assemble_observation(
     position_error: torch.Tensor,
     rotation_matrix: torch.Tensor,

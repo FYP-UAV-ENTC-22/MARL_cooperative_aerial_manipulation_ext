@@ -52,6 +52,13 @@ import MARL_mav_carry_ext.tasks  # noqa: F401, E402  -- registers the task
 
 def main() -> None:
     env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
+    # The trace is a reference for arithmetic: the observation must be the recorded state, exactly. Tasks that give
+    # the policy a noisy, delayed state are recorded without either.
+    for name in ("drone_pos_noise_std", "drone_rot_noise_std", "drone_lin_vel_noise_std", "drone_ang_vel_noise_std",
+                 "payload_pos_noise_std", "payload_rot_noise_std"):
+        setattr(env_cfg, name, 0.0)
+    env_cfg.obs_delay_steps_range = (0, 0)
+    env_cfg.payload_obs_delay_steps = 0
     agent_cfg = load_cfg_from_registry(args.task, "skrl_mappo_cfg_entry_point")
     env_cfg.seed = agent_cfg["seed"]
     env = gym.make(args.task, cfg=env_cfg)
