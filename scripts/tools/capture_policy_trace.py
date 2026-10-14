@@ -59,6 +59,8 @@ def main() -> None:
         setattr(env_cfg, name, 0.0)
     env_cfg.obs_delay_steps_range = (0, 0)
     env_cfg.payload_obs_delay_steps = 0
+    if hasattr(env_cfg, "flight_stack"):
+        env_cfg.flight_stack = None  # the task that models the flight stack: the estimators and links are noise and delay too
     agent_cfg = load_cfg_from_registry(args.task, "skrl_mappo_cfg_entry_point")
     env_cfg.seed = agent_cfg["seed"]
     env = gym.make(args.task, cfg=env_cfg)
@@ -101,7 +103,10 @@ def main() -> None:
             rows["sp_vel"].append(cpu(u.sp_vel))
             rows["sp_yaw"].append(cpu(u.sp_yaw))
             if any(bool(v.any()) for v in (*terminated.values(), *truncated.values())):
-                print(f"episode ended at step {step}; the trace stops there")
+                # the environment has already reset: this step's setpoint rows are the reset's, not the integrator's
+                for values in rows.values():
+                    del values[step:]
+                print(f"episode ended at step {step}; the trace stops before it")
                 break
 
     out_path = args.out or args.checkpoint.resolve().parents[1] / "exported" / "policy_trace.npz"

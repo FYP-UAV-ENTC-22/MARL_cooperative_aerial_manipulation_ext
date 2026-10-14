@@ -7,6 +7,7 @@
 import math
 
 from MARL_mav_carry_ext.assets import FLYCRANE_CFG
+from MARL_mav_carry_ext.vehicle import FlightStackCfg
 
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
@@ -230,6 +231,15 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
     payload_pos_noise_std = 0.0  # m
     payload_rot_noise_std = 0.0  # rad
 
+    # The point on each drone that the task calls its position, for the policy, RAPTOR, rewards and terminations
+    # alike: "com" is the body's centre of mass, "origin" the body frame's origin, which is the point PX4 estimates
+    # and RAPTOR flies on the aircraft.
+    drone_point: str = "com"
+    # PX4's estimator, the DDS and Wi-Fi links and the ESCs between the simulated bodies and the two controllers
+    # (vehicle/flight_stack.py). None: RAPTOR and the policy are given the true state, with the noise and delay
+    # configured above for the policy.
+    flight_stack: FlightStackCfg | None = None
+
     # RAPTOR setpoint generation
     setpoint_step_scale = 0.05  # m per high-level tick -> 2.5 m/s of authority at 50 Hz
     # Upper bound on how fast a setpoint may move. The policy's actions are unbounded, so without it
@@ -262,6 +272,15 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
     action_smoothness_weight = 0.5  # now penalises setpoint jerk, i.e. trajectory smoothness
     force_penalty_weight = 0.5
     downwash_rew_weight = 0.5
+    # Holding still at the goal: a bonus of weight * exp(-(payload position error / gate)^2) * exp(-mean drone
+    # speed / speed scale). The other terms barely see a small oscillation of the drones under a payload that is
+    # already at its goal; this one pays for a calm hover there and nothing on the way. 0: off.
+    # The scales are set from the flight-stack task's policy at step 75,000, late in its episodes (median payload
+    # error 0.084 m, median mean drone speed 0.17 m/s): it collects about 30% of the bonus, so there is a slope to
+    # climb. Tighter scales (0.10 m, 0.05 m/s) gave it under 5%.
+    hold_still_weight = 0.0
+    hold_still_goal_gate = 0.20  # m
+    hold_still_speed_scale = 0.15  # m/s
 
     # goal terms
     goal_range = {
